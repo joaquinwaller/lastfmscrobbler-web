@@ -1,0 +1,7 @@
+lastfmscrobbler.lat, www.lastfmscrobbler.lat {
+	reverse_proxy frontend:80
+}
+
+api.lastfmscrobbler.lat {
+	reverse_proxy backend:8080
+}
