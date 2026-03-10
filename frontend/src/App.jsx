@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080'
 const STORAGE_KEY = 'lfm_auth'
+const MAX_DAILY_SCROBBLES = 3000
 
 function readAuthFromStorage() {
   try {
@@ -36,6 +37,14 @@ function sameAuth(a, b) {
   return a.token === b.token && a.user?.id === b.user?.id
 }
 
+function clearStoredAuth() {
+  localStorage.removeItem(STORAGE_KEY)
+}
+
+function persistAuth(nextAuth) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(nextAuth))
+}
+
 async function apiPost(path, token, body = {}) {
   const headers = {
     'Content-Type': 'application/json',
@@ -57,31 +66,97 @@ async function apiPost(path, token, body = {}) {
   return data
 }
 
-export default function App() {
-  const searchTypeOptions = [
-    { value: 'artist', label: 'Artist' },
-    { value: 'playlist', label: 'Playlist' },
-    { value: 'album', label: 'Album' },
-    { value: 'track', label: 'Track' },
-  ]
+async function apiRefresh(token) {
+  return apiPost('/auth/refresh', token)
+}
 
+async function apiGet(path) {
+  let res
+  try {
+    res = await fetch(`${API_BASE_URL.replace(/\/$/, '')}${path}`)
+  } catch {
+    throw new Error('Could not reach the API. Please try again in a few seconds.')
+  }
+
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    throw new Error(data.error || `Request failed with ${res.status}`)
+  }
+  return data
+}
+
+export default function App() {
   const [auth, setAuth] = useState(() => readAuthFromStorage())
   const [status, setStatus] = useState('')
   const [loginLoading, setLoginLoading] = useState(false)
 
   const [url, setURL] = useState('')
-  const [inputMode, setInputMode] = useState('url')
-  const [searchQuery, setSearchQuery] = useState('')
-  const [searchLoading, setSearchLoading] = useState(false)
-  const [searchResults, setSearchResults] = useState([])
-  const [searchError, setSearchError] = useState('')
-  const [searchType, setSearchType] = useState('artist')
   const [amount, setAmount] = useState(100)
   const [preview, setPreview] = useState(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError, setPreviewError] = useState('')
   const [runLoading, setRunLoading] = useState(false)
   const [runResult, setRunResult] = useState(null)
+
+  function applyAuth(nextAuth) {
+    persistAuth(nextAuth)
+    setAuth(nextAuth)
+  }
+
+  function resetAuth(message = 'Your session expired. Please log in again.') {
+    clearStoredAuth()
+    setAuth(null)
+    setLoginLoading(false)
+    setRunLoading(false)
+    setPreviewLoading(false)
+    setRunResult(null)
+    setStatus(message)
+  }
+
+  async function runAuthedPost(path, body = {}) {
+    if (!auth?.token) {
+      resetAuth('Your session expired. Please log in again.')
+      throw new Error('Authentication required')
+    }
+
+    try {
+      return await apiPost(path, auth.token, body)
+    } catch (err) {
+      const message = String(err?.message || '')
+      if (!message.includes('401') && !message.toLowerCase().includes('authorization') && !message.toLowerCase().includes('token')) {
+        throw err
+      }
+
+      try {
+        const refreshed = await apiRefresh(auth.token)
+        if (!refreshed?.token || !refreshed?.user) {
+          throw new Error('Invalid refresh response')
+        }
+
+        const nextAuth = { token: refreshed.token, user: refreshed.user }
+        applyAuth(nextAuth)
+        return await apiPost(path, nextAuth.token, body)
+      } catch {
+        resetAuth('Your session is no longer valid. Please log in again.')
+        throw new Error('Your session is no longer valid. Please log in again.')
+      }
+    }
+  }
+
+  function handleAmountChange(event) {
+    const nextValue = event.target.value
+    if (nextValue === '') {
+      setAmount('')
+      return
+    }
+
+    const parsed = Number(nextValue)
+    if (Number.isNaN(parsed)) {
+      return
+    }
+
+    setAmount(Math.min(MAX_DAILY_SCROBBLES, Math.max(1, parsed)))
+  }
 
   useEffect(() => {
     if (window.location.pathname !== '/auth/callback') {
@@ -91,7 +166,7 @@ export default function App() {
     const nextAuth = parseAuthFromHash(window.location.hash)
 
     if (nextAuth) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(nextAuth))
+      persistAuth(nextAuth)
       if (window.opener && window.opener !== window) {
         window.opener.postMessage({ type: 'lastfm-auth-success', payload: nextAuth }, window.location.origin)
         window.close()
@@ -114,8 +189,7 @@ export default function App() {
         return
       }
       if (event.data?.type === 'lastfm-auth-success' && event.data?.payload) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(event.data.payload))
-        setAuth(event.data.payload)
+        applyAuth(event.data.payload)
         setStatus('Last.fm connection completed.')
         setLoginLoading(false)
       }
@@ -156,39 +230,34 @@ export default function App() {
   }, [loginLoading, auth])
 
   useEffect(() => {
-    if (!auth?.token || inputMode !== 'search') {
+    if (!auth?.token) {
       return
     }
 
-    const q = searchQuery.trim()
-    if (q.length < 2) {
-      setSearchResults([])
-      setSearchError('')
-      setSearchLoading(false)
-      return
-    }
+    let cancelled = false
 
-    const timeout = window.setTimeout(async () => {
-      setSearchLoading(true)
-      setSearchError('')
+    void (async () => {
       try {
-        const data = await apiPost('/scrobble/search', auth.token, { query: q, limit: 8, type: searchType })
-        setSearchResults(Array.isArray(data.items) ? data.items : [])
-      } catch (err) {
-        setSearchResults([])
-        setSearchError(err.message)
-      } finally {
-        setSearchLoading(false)
+        const refreshed = await apiRefresh(auth.token)
+        if (cancelled || !refreshed?.token || !refreshed?.user) {
+          return
+        }
+
+        const nextAuth = { token: refreshed.token, user: refreshed.user }
+        if (!sameAuth(auth, nextAuth) || auth.user?.username !== nextAuth.user?.username) {
+          applyAuth(nextAuth)
+        }
+      } catch {
+        if (!cancelled) {
+          resetAuth('Your saved session expired or became invalid. Please log in again.')
+        }
       }
-    }, 350)
+    })()
 
-    return () => window.clearTimeout(timeout)
-  }, [auth?.token, inputMode, searchQuery, searchType])
-
-  useEffect(() => {
-    setSearchResults([])
-    setSearchError('')
-  }, [searchType])
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     if (!auth?.token) {
@@ -206,7 +275,7 @@ export default function App() {
       setPreviewLoading(true)
       setPreviewError('')
       try {
-        const data = await apiPost('/scrobble/preview', auth.token, { url: cleaned })
+        const data = await runAuthedPost('/scrobble/preview', { url: cleaned })
         setPreview(data.preview)
       } catch (err) {
         setPreview(null)
@@ -220,14 +289,10 @@ export default function App() {
   }, [auth?.token, url])
 
   function logout() {
-    localStorage.removeItem(STORAGE_KEY)
+    clearStoredAuth()
     setAuth(null)
     setStatus('Signed out.')
     setURL('')
-    setSearchQuery('')
-    setSearchResults([])
-    setSearchError('')
-    setInputMode('url')
     setPreview(null)
     setPreviewError('')
     setRunResult(null)
@@ -249,42 +314,62 @@ export default function App() {
       const top = Math.max(0, window.screenY + (window.outerHeight - height) / 2)
       const features = `popup=yes,width=${width},height=${height},left=${Math.round(left)},top=${Math.round(top)}`
 
-      let popup = null
+      let popup = window.open('', 'lastfm-auth', features)
       try {
-        const startData = await fetch(`${API_BASE_URL.replace(/\/$/, '')}/auth/lastfm/start.json`)
-        const parsed = await startData.json().catch(() => ({}))
-        if (!startData.ok || !parsed.auth_url || !parsed.token) {
-          throw new Error(parsed.error || 'Could not start Last.fm login')
-        }
-
-        popup = window.open(parsed.auth_url, 'lastfm-auth', features)
         if (!popup) {
           throw new Error('Your browser blocked the popup. Please allow popups and try again.')
         }
+        popup.document.title = 'Last.fm login'
+        popup.document.body.innerHTML = '<p style="font-family: sans-serif; padding: 24px;">Connecting to Last.fm...</p>'
+
+        const parsed = await apiGet('/auth/lastfm/start.json')
+        if (!parsed.auth_url || !parsed.token) {
+          throw new Error('Could not start Last.fm login')
+        }
+
+        popup.location.replace(parsed.auth_url)
         popup.focus()
 
+        let consecutivePollFailures = 0
+        const deadline = Date.now() + 90_000
+
         const poller = window.setInterval(async () => {
+          if (Date.now() > deadline) {
+            window.clearInterval(poller)
+            setLoginLoading(false)
+            setStatus('Login timeout. Close the authorization window and try again.')
+            if (popup && !popup.closed) {
+              popup.focus()
+            }
+            return
+          }
+
           try {
-            const res = await fetch(`${API_BASE_URL.replace(/\/$/, '')}/auth/lastfm/poll?token=${encodeURIComponent(parsed.token)}`)
-            if (res.status === 202) {
+            const data = await apiGet(`/auth/lastfm/poll?token=${encodeURIComponent(parsed.token)}`)
+            consecutivePollFailures = 0
+            if (!data?.token || !data?.user) {
               return
             }
-            const data = await res.json().catch(() => ({}))
-            if (!res.ok) {
-              throw new Error(data.error || 'Authorization check failed')
-            }
-            if (data?.token && data?.user) {
-              const nextAuth = { token: data.token, user: data.user }
-              localStorage.setItem(STORAGE_KEY, JSON.stringify(nextAuth))
-              setAuth(nextAuth)
-              setStatus('Last.fm connection completed.')
-              setLoginLoading(false)
-              window.clearInterval(poller)
-              if (popup && !popup.closed) {
-                popup.close()
-              }
+
+            const nextAuth = { token: data.token, user: data.user }
+            applyAuth(nextAuth)
+            setStatus('Last.fm connection completed.')
+            setLoginLoading(false)
+            window.clearInterval(poller)
+            if (popup && !popup.closed) {
+              popup.close()
             }
           } catch (err) {
+            if (String(err?.message || '').includes('Request failed with 202')) {
+              consecutivePollFailures = 0
+              return
+            }
+
+            consecutivePollFailures += 1
+            if (consecutivePollFailures < 5) {
+              return
+            }
+
             window.clearInterval(poller)
             setLoginLoading(false)
             setStatus(err.message || 'Login error')
@@ -310,9 +395,9 @@ export default function App() {
     setStatus('')
 
     try {
-      const data = await apiPost('/scrobble/start', auth.token, {
+      const data = await runAuthedPost('/scrobble/start', {
         url: url.trim(),
-        amount: Number(amount) || 0,
+        amount: Math.min(MAX_DAILY_SCROBBLES, Number(amount) || 0),
       })
       setRunResult(data)
       setStatus('Scrobble completed.')
@@ -320,30 +405,6 @@ export default function App() {
       setStatus(err.message)
     } finally {
       setRunLoading(false)
-    }
-  }
-
-  function pickSearchItem(item) {
-    if (!item?.source_url) {
-      return
-    }
-    setURL(item.source_url)
-    setStatus(`Selected ${item.type}: ${item.title}`)
-    setRunResult(null)
-  }
-
-  function searchPlaceholder(type) {
-    switch (type) {
-      case 'artist':
-        return 'Search an artist (e.g. Drake)'
-      case 'track':
-        return 'Search a track'
-      case 'playlist':
-        return 'Search a playlist'
-      case 'album':
-        return 'Search an album'
-      default:
-        return 'Search Spotify'
     }
   }
 
@@ -357,9 +418,7 @@ export default function App() {
             <div className="login-box">
               <p className="eyebrow">Last.fm Integration</p>
               <h1 className="brand">last.fm scrobbler</h1>
-              <p className="subtitle">
-                Connect your account to start scrobbling Spotify links or search Spotify directly.
-              </p>
+              <p className="subtitle">Connect your account to start scrobbling Spotify links in bulk.</p>
               <button className="cta" type="button" onClick={startLoginPopup} disabled={loginLoading}>
                 <span className="cta-badge">fm</span>
                 <span>{loginLoading ? 'Waiting for login...' : 'Login with Last.fm'}</span>
@@ -371,7 +430,7 @@ export default function App() {
                 <div>
                   <p className="eyebrow">Scrobble Dashboard</p>
                   <h1 className="brand">last.fm scrobbler</h1>
-                  <p className="subtitle">Pick a Spotify URL or find content from search, then scrobble in bulk.</p>
+                  <p className="subtitle">Paste a Spotify URL, preview the tracks, then scrobble in bulk.</p>
                 </div>
                 <div className="top-actions">
                   <div className="connected-pill">Connected as @{auth.user.username}</div>
@@ -382,72 +441,6 @@ export default function App() {
               </header>
 
               <section className="scrobble-box">
-                <div className="mode-row">
-                  <button
-                    type="button"
-                    className={`mode-btn ${inputMode === 'url' ? 'active' : ''}`}
-                    onClick={() => setInputMode('url')}
-                  >
-                    Use URL
-                  </button>
-                  <button
-                    type="button"
-                    className={`mode-btn ${inputMode === 'search' ? 'active' : ''}`}
-                    onClick={() => setInputMode('search')}
-                  >
-                    Search Spotify
-                  </button>
-                </div>
-
-                {inputMode === 'search' ? (
-                  <div className="search-box">
-                    <div className="search-query-row">
-                      <label className="field field-search-query">
-                        <span>Search query</span>
-                        <input
-                          type="text"
-                          value={searchQuery}
-                          onChange={(e) => setSearchQuery(e.target.value)}
-                          placeholder={searchPlaceholder(searchType)}
-                        />
-                      </label>
-                      <label className="field field-search-type">
-                        <span>Filter</span>
-                        <select value={searchType} onChange={(e) => setSearchType(e.target.value)}>
-                          {searchTypeOptions.map((option) => (
-                            <option key={option.value} value={option.value}>
-                              {option.label}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </div>
-
-                    {searchLoading && <p className="status-note">Searching Spotify...</p>}
-                    {searchError && <p className="status-note error">{searchError}</p>}
-
-                    {searchResults.length > 0 && (
-                      <div className="search-results">
-                        {searchResults.map((item) => (
-                          <button
-                            key={`${item.type}-${item.id}`}
-                            type="button"
-                            className={`search-item ${url === item.source_url ? 'selected' : ''}`}
-                            onClick={() => pickSearchItem(item)}
-                          >
-                            {item.image ? <img src={item.image} alt={item.title} /> : <div className="cover-fallback">{item.type}</div>}
-                            <div>
-                              <p className="preview-type">{item.type}</p>
-                              <p className="search-title">{item.title}</p>
-                              <p className="search-subtitle">{item.subtitle}</p>
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                ) : null}
-
                 <label className="field">
                   <span>Spotify URL</span>
                   <input
@@ -458,15 +451,22 @@ export default function App() {
                   />
                 </label>
 
+                <article className="info-card">
+                  <p className="info-card-title">Daily scrobble limit</p>
+                  <p className="info-card-copy">
+                    The limit is 3,000 scrobbles per day, and it resets daily at 00:00 GMT.
+                  </p>
+                </article>
+
                 <div className="run-row">
                   <label className="field field-small">
                     <span>Amount</span>
                     <input
                       type="number"
                       min="1"
-                      max="3000"
+                      max={MAX_DAILY_SCROBBLES}
                       value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
+                      onChange={handleAmountChange}
                     />
                   </label>
                   <button

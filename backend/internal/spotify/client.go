@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,7 +52,27 @@ type Client struct {
 
 	accessToken string
 	tokenExpiry time.Time
+	mu          sync.RWMutex
+
+	previewCache map[string]previewCacheEntry
+	searchCache  map[string]searchCacheEntry
 }
+
+type previewCacheEntry struct {
+	preview   Preview
+	tracks    []Track
+	expiresAt time.Time
+}
+
+type searchCacheEntry struct {
+	items     []SearchItem
+	expiresAt time.Time
+}
+
+const (
+	previewCacheTTL = 2 * time.Minute
+	searchCacheTTL  = 30 * time.Second
+)
 
 func New(clientID, clientSecret string) *Client {
 	return &Client{
@@ -60,7 +81,9 @@ func New(clientID, clientSecret string) *Client {
 		HTTP: &http.Client{
 			Timeout: 20 * time.Second,
 		},
-		Now: time.Now,
+		Now:          time.Now,
+		previewCache: make(map[string]previewCacheEntry),
+		searchCache:  make(map[string]searchCacheEntry),
 	}
 }
 
@@ -109,17 +132,28 @@ func (c *Client) ResolveByTypeAndID(ctx context.Context, itemType, id, market, s
 	if market == "" {
 		market = "US"
 	}
+	cacheKey := previewCacheKey(itemType, id, market)
+	if preview, tracks, ok := c.getCachedPreview(cacheKey); ok {
+		preview.SourceURL = sourceURL
+		return preview, tracks, nil
+	}
 	if err := c.refreshToken(ctx); err != nil {
 		return Preview{}, nil, err
 	}
 
+	var (
+		preview Preview
+		tracks  []Track
+		err     error
+	)
 	switch itemType {
 	case "track":
-		t, err := c.getTrack(ctx, id)
+		var t Track
+		t, err = c.getTrack(ctx, id)
 		if err != nil {
 			return Preview{}, nil, err
 		}
-		preview := Preview{
+		preview = Preview{
 			Type:      itemType,
 			ID:        id,
 			Title:     t.Name,
@@ -130,16 +164,22 @@ func (c *Client) ResolveByTypeAndID(ctx context.Context, itemType, id, market, s
 			Market:    market,
 			SourceURL: sourceURL,
 		}
-		return preview, []Track{t}, nil
+		tracks = []Track{t}
 	case "album":
-		return c.resolveAlbum(ctx, id, market, sourceURL)
+		preview, tracks, err = c.resolveAlbum(ctx, id, market, sourceURL)
 	case "playlist":
-		return c.resolvePlaylist(ctx, id, market, sourceURL)
+		preview, tracks, err = c.resolvePlaylist(ctx, id, market, sourceURL)
 	case "artist":
-		return c.resolveArtist(ctx, id, market, sourceURL)
+		preview, tracks, err = c.resolveArtist(ctx, id, market, sourceURL)
 	default:
 		return Preview{}, nil, errors.New("unsupported spotify type")
 	}
+	if err != nil {
+		return Preview{}, nil, err
+	}
+	c.setCachedPreview(cacheKey, preview, tracks)
+	preview.SourceURL = sourceURL
+	return preview, tracks, nil
 }
 
 func (c *Client) Search(ctx context.Context, query, market string, limit int, itemType string) ([]SearchItem, error) {
@@ -155,6 +195,10 @@ func (c *Client) Search(ctx context.Context, query, market string, limit int, it
 	}
 	if market == "" {
 		market = "US"
+	}
+	cacheKey := searchCacheKey(query, market, limit, itemType)
+	if items, ok := c.getCachedSearch(cacheKey); ok {
+		return items, nil
 	}
 	searchType, allowedTypes, err := normalizeSearchType(itemType)
 	if err != nil {
@@ -313,6 +357,7 @@ func (c *Client) Search(ctx context.Context, query, market string, limit int, it
 		}
 	}
 
+	c.setCachedSearch(cacheKey, items)
 	return items, nil
 }
 
@@ -409,7 +454,11 @@ func (c *Client) resolveArtist(ctx context.Context, id, market, sourceURL string
 }
 
 func (c *Client) refreshToken(ctx context.Context) error {
-	if c.accessToken != "" && c.Now().Before(c.tokenExpiry.Add(-30*time.Second)) {
+	c.mu.RLock()
+	accessToken := c.accessToken
+	tokenExpiry := c.tokenExpiry
+	c.mu.RUnlock()
+	if accessToken != "" && c.Now().Before(tokenExpiry.Add(-30*time.Second)) {
 		return nil
 	}
 
@@ -434,6 +483,9 @@ func (c *Client) refreshToken(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return spotifyRateLimitError(resp)
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return fmt.Errorf("spotify token failed: status %d: %s", resp.StatusCode, string(body))
@@ -450,8 +502,10 @@ func (c *Client) refreshToken(ctx context.Context) error {
 		return errors.New("spotify token empty")
 	}
 
+	c.mu.Lock()
 	c.accessToken = out.AccessToken
 	c.tokenExpiry = c.Now().Add(time.Duration(out.ExpiresIn) * time.Second)
+	c.mu.Unlock()
 	return nil
 }
 
@@ -804,7 +858,10 @@ func (c *Client) getAPI(ctx context.Context, path string, q url.Values, out any)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.accessToken)
+	c.mu.RLock()
+	accessToken := c.accessToken
+	c.mu.RUnlock()
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -812,12 +869,84 @@ func (c *Client) getAPI(ctx context.Context, path string, q url.Values, out any)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return spotifyRateLimitError(resp)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("spotify api failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *Client) getCachedPreview(key string) (Preview, []Track, bool) {
+	c.mu.RLock()
+	entry, ok := c.previewCache[key]
+	c.mu.RUnlock()
+	if !ok || c.Now().After(entry.expiresAt) {
+		if ok {
+			c.mu.Lock()
+			delete(c.previewCache, key)
+			c.mu.Unlock()
+		}
+		return Preview{}, nil, false
+	}
+
+	preview := entry.preview
+	tracks := append([]Track(nil), entry.tracks...)
+	return preview, tracks, true
+}
+
+func (c *Client) setCachedPreview(key string, preview Preview, tracks []Track) {
+	c.mu.Lock()
+	c.previewCache[key] = previewCacheEntry{
+		preview:   preview,
+		tracks:    append([]Track(nil), tracks...),
+		expiresAt: c.Now().Add(previewCacheTTL),
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) getCachedSearch(key string) ([]SearchItem, bool) {
+	c.mu.RLock()
+	entry, ok := c.searchCache[key]
+	c.mu.RUnlock()
+	if !ok || c.Now().After(entry.expiresAt) {
+		if ok {
+			c.mu.Lock()
+			delete(c.searchCache, key)
+			c.mu.Unlock()
+		}
+		return nil, false
+	}
+
+	return append([]SearchItem(nil), entry.items...), true
+}
+
+func (c *Client) setCachedSearch(key string, items []SearchItem) {
+	c.mu.Lock()
+	c.searchCache[key] = searchCacheEntry{
+		items:     append([]SearchItem(nil), items...),
+		expiresAt: c.Now().Add(searchCacheTTL),
+	}
+	c.mu.Unlock()
+}
+
+func previewCacheKey(itemType, id, market string) string {
+	return strings.ToLower(strings.TrimSpace(itemType)) + ":" + strings.TrimSpace(id) + ":" + strings.ToUpper(strings.TrimSpace(market))
+}
+
+func searchCacheKey(query, market string, limit int, itemType string) string {
+	return strings.ToLower(strings.TrimSpace(query)) + ":" + strings.ToUpper(strings.TrimSpace(market)) + ":" + fmt.Sprint(limit) + ":" + strings.ToLower(strings.TrimSpace(itemType))
+}
+
+func spotifyRateLimitError(resp *http.Response) error {
+	retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if retryAfter != "" {
+		return fmt.Errorf("spotify rate limit reached; wait %s seconds and try again", retryAfter)
+	}
+	return errors.New("spotify rate limit reached; wait a minute and try again")
 }
 
 func sampleTracks(tracks []Track, max int) []Track {

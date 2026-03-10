@@ -1,6 +1,6 @@
 # LastFmScrobbler
 
-Bulk scrobbling web app for Last.fm with Spotify URL preview/search support.
+Bulk scrobbling web app for Last.fm with Spotify URL preview support.
 
 ## Live App
 
@@ -19,7 +19,6 @@ Bulk scrobbling web app for Last.fm with Spotify URL preview/search support.
 
 - Last.fm authentication
 - Spotify URL preview
-- Spotify search
 - Bulk scrobbling workflow
 - PostgreSQL-backed user storage
 

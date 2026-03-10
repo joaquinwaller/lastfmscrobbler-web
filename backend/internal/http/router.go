@@ -1,6 +1,7 @@
 package http
 
 import (
+	"net/url"
 	"net/http"
 	"strings"
 
@@ -30,11 +31,11 @@ func NewRouter(authHandler *auth.Handler, scrobbleHandler *scrobble.Handler, fro
 }
 
 func cors(frontendURL string) func(http.Handler) http.Handler {
-	allowed := strings.TrimRight(frontendURL, "/")
+	allowedOrigins := buildAllowedOrigins(frontendURL)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			origin := r.Header.Get("Origin")
-			if origin != "" && (allowed == "" || origin == allowed) {
+			if origin != "" && (len(allowedOrigins) == 0 || allowedOrigins[origin]) {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Vary", "Origin")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -49,4 +50,37 @@ func cors(frontendURL string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func buildAllowedOrigins(frontendURL string) map[string]bool {
+	trimmed := strings.TrimRight(strings.TrimSpace(frontendURL), "/")
+	if trimmed == "" {
+		return nil
+	}
+
+	allowed := map[string]bool{trimmed: true}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return allowed
+	}
+
+	host := parsed.Hostname()
+	if host == "" || host == "localhost" {
+		return allowed
+	}
+
+	counterpartHost := host
+	if strings.HasPrefix(host, "www.") {
+		counterpartHost = strings.TrimPrefix(host, "www.")
+	} else {
+		counterpartHost = "www." + host
+	}
+
+	counterpart := parsed.Scheme + "://" + counterpartHost
+	if port := parsed.Port(); port != "" {
+		counterpart += ":" + port
+	}
+
+	allowed[counterpart] = true
+	return allowed
 }

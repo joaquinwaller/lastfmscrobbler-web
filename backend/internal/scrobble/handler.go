@@ -23,7 +23,7 @@ func (h *Handler) Preview(w http.ResponseWriter, r *http.Request) {
 
 	preview, err := h.Service.Preview(r.Context(), req)
 	if err != nil {
-		h.writeError(w, http.StatusBadRequest, err.Error())
+		h.writeError(w, statusForError(err), err.Error())
 		return
 	}
 
@@ -39,7 +39,7 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 
 	items, err := h.Service.Search(r.Context(), req)
 	if err != nil {
-		h.writeError(w, http.StatusBadRequest, err.Error())
+		h.writeError(w, statusForError(err), err.Error())
 		return
 	}
 
@@ -61,7 +61,7 @@ func (h *Handler) Start(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.Service.Start(r.Context(), claims.Subject, req)
 	if err != nil {
-		h.writeError(w, http.StatusBadRequest, err.Error())
+		h.writeError(w, statusForError(err), err.Error())
 		return
 	}
 
@@ -95,4 +95,17 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func (h *Handler) writeError(w http.ResponseWriter, status int, message string) {
 	h.writeJSON(w, status, map[string]string{"error": message})
+}
+
+func statusForError(err error) int {
+	if err == nil {
+		return http.StatusBadRequest
+	}
+
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(msg, "rate limit") || strings.Contains(msg, "status 429") {
+		return http.StatusTooManyRequests
+	}
+
+	return http.StatusBadRequest
 }
